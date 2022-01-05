@@ -14,7 +14,9 @@ Add 10k pull-up resistors to these 65C02 pins
 - !RESET
 - !NMI
 - !SO
-- !RDY
+- !RDY  
+
+Or get it here from EasyEDA: https://easyeda.com/dherrendoerfer/bad6502
 ### software
 There's a cpu subdir in this repo which contains a set of files to start and run the cpu very much like fake6502.  
 A backend for some support hardware is there for testing, but more will come over time.
