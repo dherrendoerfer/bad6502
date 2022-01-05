@@ -162,7 +162,6 @@ void step65C02()
     write65C02(addr, data);
   }
 
-
   if (_65C02irq) {
     GPIO_SET = 1<<27; //release !IRQ
     _65C02irq = 0;

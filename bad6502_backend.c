@@ -20,12 +20,19 @@
 #include <errno.h>
 #include <time.h>
 #include <unistd.h>
+#include <string.h>
+#include <pthread.h>
 #include "cpu/bad65C02.h"
 
+#include "6502asm/test.h"
+
 // Memory layout 
-unsigned char mem[0x10000];
-unsigned char *page[256];
-unsigned char page_type[256];
+volatile unsigned char mem[0x10000];
+volatile unsigned char *page[256];
+volatile unsigned char page_type[256];
+
+// Threads
+pthread_t IOthread, CPUthread, VIDthread;
 
 // install_reset_vector: set target for reset
 inline void install_reset_vect(unsigned int vect) 
@@ -48,23 +55,93 @@ inline void install_nmi_vect(unsigned int vect)
   mem[0xFFFB]=(vect&0xff00)>>8;
 }
 
+// IO Thread (slightly async)
+volatile uint16_t io_mbox[256];
+volatile uint8_t updateIO_ready = 0;
+void *updateIO()
+{
+  uint8_t box_pos = 0;
+  fprintf(stdout,"Terminal:\n");
+  updateIO_ready = 1;
+
+  while (1) {
+    if (io_mbox[box_pos]) {
+      uint16_t addr = io_mbox[box_pos];
+      if (addr == 0x100) {
+        fprintf(stdout,"%c",mem[addr]);
+      }
+      io_mbox[box_pos++] = 0;
+    }
+  }
+}
+
+// CPU thread (sync)
+volatile uint32_t run_state=3;
+void *run6502()
+{
+  reset65C02();
+
+  run_state = 0;
+  while (1) {
+    while(run_state == 0);
+    step65C02();
+    run_state--;
+  }
+}
+
+// Video thread (mostly async)
+volatile uint32_t vid_state=3;
+void *videoOut()
+{
+  vid_state=0;
+  while(vid_state==0);
+  // Implement me !
+
+}
+
 // required function 
 uint8_t read65C02(uint16_t address)
 {
   return mem[address];
 }
 
+volatile uint8_t iobox = 0;
+
 // required function 
 void write65C02(uint16_t address, uint8_t value)
 {
-  if (page_type[address>>8] == 1) //Only write to RAM
+  uint8_t page = address>>8;
+
+  if (page_type[page] < 3) //Only write to RAM/IO
     mem[address]=value;
+
+  if (page_type[page] == 2) //Notify HW (thread)
+    io_mbox[iobox++]=address;
 }
 
+// Main prog
 int main(int argc, char **argv)
 {
   int addr=0;
   long g;
+
+  if (pthread_create(&IOthread, NULL, updateIO, NULL)) {
+    printf("thread create failed\n");
+    exit(-1);
+  }
+  while(!updateIO_ready);
+
+  if (pthread_create(&CPUthread, NULL, run6502, NULL)) {
+    printf("thread create failed\n");
+    exit(-1);
+  }
+  while(run_state);
+  
+  if (pthread_create(&VIDthread, NULL, videoOut, NULL)) {
+    printf("thread create failed\n");
+    exit(-1);
+  }
+  while(vid_state);
 
   // Set up pages and memory (1st go: all RAM)
   for (g=0; g<256; g++) {
@@ -72,20 +149,22 @@ int main(int argc, char **argv)
     page_type[g]=1; //RAM
   }
 
+  // Page 1 -> IO
+  page_type[1]=2; //IO
+
   // Install ROM/vectors
   install_reset_vect(0x1000);
   install_irq_vect(0x2000);
 
-  reset65C02();
+  // Install test bin
+  for (g=0; g<test_len; g++)
+    mem[0x1000+g]=test[g];
 
-  g=0;
-
-  while (g<1000000) {
-    step65C02();
-    g++;
+  // Run 1Million cycles
+  for (g=0; g<10000; g++) {
+    while(run_state>0);
+    run_state=1000;
   }
 
   return 0;
-
-} // main
-
+}
