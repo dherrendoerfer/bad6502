@@ -7,7 +7,8 @@ Simply put, strap a WDC65C02 to a Raspberry Pi Zero 2W like this:
 - GPIO 24 -> !RW
 - GPIO 25 -> CLOCK
 - GPIO 26 -> !RESET
-- GPIO 27 -> !IRQ
+- GPIO 27 -> !IRQ  
+
 Add 10k pull-up resistors to these 65C02 pins
 - !IRQ
 - !RESET
