@@ -53,6 +53,8 @@ volatile unsigned *gpio;
 
 #define GET_ADDR (*(gpio+13)>>8)&0xFFFF
 #define GET_DATA (*(gpio+13))&0xFF
+#define GET_RW (*(gpio+13))&(1<<24)
+#define GET_ALL_GPIO *(gpio+13)
 
 // Local helpers 
 void setup_io();
@@ -67,7 +69,7 @@ extern uint8_t read65C02(uint16_t address);
 extern void write65C02(uint16_t address, uint8_t value);
 
 // Tick counter
-uint32_t clockticks65C02;
+volatile uint32_t clockticks65C02;
 
 uint8_t proc_init_done = 0;
 
@@ -123,43 +125,49 @@ void init65C02()
 }
 
 
+uint32_t bus_data=0;
+uint32_t bus_rw;
+uint32_t bus_addr;
+
 void step65C02() 
 {
   //TODO: The delays need to be optimized (scoped)
-  uint32_t data=0;
-  uint32_t rw;
-  uint32_t addr;
 
   // Clock cycle start (clock goes low)
   GPIO_CLR = 1<<25;
 
   // wait the setup time to read the next addr
-  ndelay(300);
+  ndelay(150);
 
   // Address and RW stable
-  rw = GET_GPIO(24);
-  addr = GET_ADDR;
-    
-  ndelay(300);
+  bus_rw = GET_RW;
+  bus_addr = GET_ADDR;
+
+
+  // Set DATA to INP or OUT based on RW
+  *(gpio) = _65C02_gpio_r;
+  if (bus_rw) {
+    *(gpio) = _65C02_gpio_w;
+  }
+
+  ndelay(100);
 
   // 2nd part of clock cycle (clock goes high)
   GPIO_SET = 1<<25;
 
-  ndelay(300);
+  ndelay(150);
 
-  *(gpio) = _65C02_gpio_r;
-  if (rw) {
+  if (bus_rw) {
     //write to 65C02
-    *(gpio) = _65C02_gpio_w;
     GPIO_CLR=0xFF;
-    GPIO_SET=read65C02(addr);
-    ndelay(300);
+    GPIO_SET=read65C02(bus_addr);
+    ndelay(150);
   }
   else {
-    ndelay(400);
-    //read from 65C02
-    data=GET_DATA;
-    write65C02(addr, data);
+    ndelay(150);
+    //read from 5C02
+    bus_data=GET_DATA;
+    write65C02(bus_addr, bus_data);
   }
 
   if (_65C02irq) {
@@ -168,12 +176,13 @@ void step65C02()
   }
 
   clockticks65C02++;
+  pc=bus_addr;
 
 #ifdef DEBUG
   if (usleep(20000))
     return;
 
-  printf("A=0x%04x,",addr);
+  printf("A=0x%04x,",bus_addr);
 
   for (int g=15; g>=0; g--) {
     if (addr&(1<<g))
@@ -184,15 +193,23 @@ void step65C02()
 
   printf(", ");
 
-  if (rw)
+  if (bus_rw)
     printf("r");
   else
     printf("w");
 
   printf(", ");
-  printf("D=0x%02x -> M=0x%02x",data,read65C02(addr));
+  printf("D=0x%02x -> M=0x%02x",bus_data,read65C02(addr));
   printf("\n");
 #endif
+}
+
+void inst65C02()
+{
+  uint16_t last_addr=bus_addr;
+
+  while (bus_addr==last_addr)
+    step65C02();
 }
 
 void exec65C02(uint32_t tickcount)
@@ -214,6 +231,7 @@ void reset65C02()
   // Perform 6502 reset
   GPIO_CLR = 1<<26; //set !RESET
   nsleep(1000);
+  one_clock();
   one_clock();
   GPIO_SET = 1<<26; //release !RESET
   nsleep(1000);

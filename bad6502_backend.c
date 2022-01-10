@@ -26,6 +26,13 @@
 
 #include "6502asm/test.h"
 
+#ifdef FAKE
+#define reset65C02 reset6502
+#define step65C02 step6502
+#define read65C02 read6502
+#define write65C02 write6502
+#endif
+
 // Memory layout 
 volatile unsigned char mem[0x10000];
 volatile unsigned char *page[256];
@@ -33,6 +40,8 @@ volatile unsigned char page_type[256];
 
 // Threads
 pthread_t IOthread, CPUthread, VIDthread;
+
+volatile uint8_t runme = 1;
 
 // install_reset_vector: set target for reset
 inline void install_reset_vect(unsigned int vect) 
@@ -61,13 +70,15 @@ volatile uint8_t updateIO_ready = 0;
 void *updateIO()
 {
   uint8_t box_pos = 0;
-  fprintf(stdout,"Terminal:\n");
+  uint16_t addr;
+  dup(1);
+  dup(2);
   updateIO_ready = 1;
 
-  while (1) {
+  while (runme) {
     if (io_mbox[box_pos]) {
-      uint16_t addr = io_mbox[box_pos];
-      if (addr == 0x100) {
+      addr = io_mbox[box_pos];
+      if (addr == 0xE000) {
         fprintf(stdout,"%c",mem[addr]);
       }
       io_mbox[box_pos++] = 0;
@@ -82,9 +93,14 @@ void *run6502()
   reset65C02();
 
   run_state = 0;
-  while (1) {
-    while(run_state == 0);
+  while (runme) {
+    while(!run_state);
     step65C02();
+#ifdef FAKE
+    usleep(1);
+//    extern volatile uint16_t pc;
+//    printf("0x%04x\n",pc);
+#endif
     run_state--;
   }
 }
@@ -94,7 +110,7 @@ volatile uint32_t vid_state=3;
 void *videoOut()
 {
   vid_state=0;
-  while(vid_state==0);
+  while(runme);
   // Implement me !
 
 }
@@ -111,12 +127,16 @@ volatile uint8_t iobox = 0;
 void write65C02(uint16_t address, uint8_t value)
 {
   uint8_t page = address>>8;
+  uint8_t type = page_type[page];
 
-  if (page_type[page] < 3) //Only write to RAM/IO
-    mem[address]=value;
+  if (type == 3) //Only write to RAM/IO
+    return;
 
-  if (page_type[page] == 2) //Notify HW (thread)
+  mem[address]=value;
+
+  if (type == 2) { //Notify HW (thread)
     io_mbox[iobox++]=address;
+  }
 }
 
 // Main prog
@@ -130,18 +150,21 @@ int main(int argc, char **argv)
     exit(-1);
   }
   while(!updateIO_ready);
+  printf("IO Thread running\n");
 
   if (pthread_create(&CPUthread, NULL, run6502, NULL)) {
     printf("thread create failed\n");
     exit(-1);
   }
   while(run_state);
+  printf("CPU Thread running\n");
   
   if (pthread_create(&VIDthread, NULL, videoOut, NULL)) {
     printf("thread create failed\n");
     exit(-1);
   }
   while(vid_state);
+  printf("VIDEO Thread running\n");
 
   // Set up pages and memory (1st go: all RAM)
   for (g=0; g<256; g++) {
@@ -150,21 +173,33 @@ int main(int argc, char **argv)
   }
 
   // Page 1 -> IO
-  page_type[1]=2; //IO
+  page_type[0xE0]=2; //IO
 
   // Install ROM/vectors
   install_reset_vect(0x1000);
-  install_irq_vect(0x2000);
+  install_irq_vect(0x1000);
 
   // Install test bin
   for (g=0; g<test_len; g++)
     mem[0x1000+g]=test[g];
 
+
+  printf("-------- START --------\n");
+
   // Run 1Million cycles
-  for (g=0; g<10000; g++) {
-    while(run_state>0);
-    run_state=1000;
+  for (g=0; g<1000; g++) {
+    while(run_state);
+    run_state=10000;
   }
+
+  runme=0;
+
+  printf("Stopping VIDEO thread\n");
+  pthread_join(VIDthread,NULL);
+  printf("Stopping IO thread\n");
+  pthread_join(IOthread,NULL);
+  printf("Stopping CPU thread\n");
+  pthread_join(CPUthread,NULL);
 
   return 0;
 }
