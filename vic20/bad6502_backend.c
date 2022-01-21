@@ -25,16 +25,21 @@
 #include <SDL.h>
 #include "cpu/bad65C02.h"
 
-#include "6502asm/test.h"
+#include "via6522_1.h"
+#include "via6522_2.h"
+#include "keyboard.h"
 
-// VIC-20 VIC implementation for test
-#include "./vic20/roms/characters.901460-03.h"
+// VIC-20
+#include "./roms/characters.901460-03.h"
+#include "./roms/basic.901486-01.h"
+#include "./roms/kernal.901486-06.h"
 
 #ifdef FAKE
 #define reset65C02 reset6502
 #define step65C02 step6502
 #define read65C02 read6502
 #define write65C02 write6502
+#define irq65C02 irq6502
 #define clockticks65C02 clockticks6502
 
 volatile extern uint32_t clockticks6502;
@@ -47,6 +52,9 @@ volatile extern uint32_t clockticks6502;
 volatile static uint8_t mem[0x10000];
 volatile static uint8_t *page[256];
 volatile static uint8_t page_type[256];
+
+// The keyboard (matrix)
+volatile uint8_t kbd_matrix[8] = {0,0,0,0,0,0,0,0};
 
 // Threads
 pthread_t IOthread, CPUthread, VIDthread;
@@ -78,26 +86,67 @@ inline static void install_nmi_vect(unsigned int vect)
 volatile uint16_t io_mbox[256];
 volatile uint8_t mbox_data[256];
 volatile uint8_t updateIO_ready = 0;
+volatile uint32_t io_ticks;
 
 void *updateIO()
 {
   uint8_t box_pos = 0;
   uint16_t addr;
-  uint32_t old_ticks = clockticks65C02;
+  uint8_t data;
+  uint8_t io_page;
+  uint8_t row;
+  uint8_t last_row;
+  uint8_t kbd_data;
   dup(1);
   dup(2);
   updateIO_ready = 1;
+  io_ticks = clockticks65C02;
 
   while (runme) {
-    while (clockticks65C02 == old_ticks);
+    // Just stop and wait here if the clock is not moving and we're up to date
+    while (clockticks65C02 == io_ticks);
+
     if (io_mbox[box_pos]) {
       addr = io_mbox[box_pos];
-      if (addr == 0xE000) {
-        fprintf(stdout,"%c",mbox_data[box_pos]);
+      data = mbox_data[box_pos];
+      io_page = addr >> 8;
+
+      switch(addr>>4) {
+        case 0x911: 
+          via1_writeReg(addr-0x9110,data);
+	  break;
+	case 0x912:
+          via2_writeReg(addr-0x9120,data);
+          break;
       }
+
       io_mbox[box_pos++] = 0;
     }
-    old_ticks++;
+
+    // Set the keyboard
+    row = ~via2_PB();
+    if (row != last_row) {
+      kbd_data = 0x00;
+      for (int g=0;g<8;g++) {
+        if (row & (1<<g)){
+          kbd_data |= kbd_matrix[g];
+        }
+      }
+      via2_setPA(~kbd_data);
+      last_row=row;
+    }
+
+    // do HW ticks
+    if (via1_tick(1)) {
+      printf("IRQ!\n");
+      irq65C02();
+    }
+    if (via2_tick(1)) {
+      printf("IRQ!\n");
+      irq65C02();
+    }
+
+    io_ticks++;
   }
 }
 
@@ -111,10 +160,15 @@ void *run6502()
   while (runme) {
     while(!run_state);
     step65C02();
+
+
 #ifdef FAKE
     ndelay(800);
-//    extern volatile uint16_t pc;
-//    printf("0x%04x\n",pc);
+    extern volatile uint16_t pc;
+    printf("clk: %ld  IO: %ld PC: 0x%04x\n", clockticks65C02, io_ticks, pc);
+#endif
+#ifndef ASYNCIO
+    while (io_ticks != clockticks65C02);
 #endif
     run_state--;
   }
@@ -211,6 +265,26 @@ void draw_console_toFB()
 }
 
 // Video thread (mostly async)
+
+
+void set_key_to_matrix(uint8_t key) 
+{
+  uint8_t row = key>>4;
+  uint8_t bit = key & 0xF;
+
+  kbd_matrix[row]|=(1<<bit);
+
+//  printf("Setting bit %i in row %i\n",bit,row);
+}
+
+void clear_key_to_matrix(uint8_t key) 
+{
+  uint8_t row = key>>4;
+  uint8_t bit = key & 0xF;
+
+  kbd_matrix[row]&=~(1<<bit);
+}
+
 volatile uint32_t vid_state=3;
 void *videoOut()
 {
@@ -234,8 +308,22 @@ void *videoOut()
 
         case SDL_KEYDOWN:
 	{
+          if(ev.key.repeat == 1)
+            break;
+
+//	  printf("%i -> %s\n",ev.key.keysym.sym,SDL_GetKeyName(ev.key.keysym.sym));
 	  if (ev.key.keysym.sym == SDLK_ESCAPE  )
             runme = 0;
+	  
+	  set_key_to_matrix(get_kbd_key(ev.key.keysym.sym));
+	  break;
+	}
+
+        case SDL_KEYUP:
+	{
+//	  printf("%i XX %s\n",ev.key.keysym.sym,SDL_GetKeyName(ev.key.keysym.sym));
+	  clear_key_to_matrix(get_kbd_key(ev.key.keysym.sym));
+	  break;
 	}
 
         case SDL_WINDOWEVENT:
@@ -253,6 +341,8 @@ void *videoOut()
               SDL_PushEvent(&ev);
               break;
             }
+            default:
+              break;
 	  }
 	}
       }
@@ -263,7 +353,7 @@ void *videoOut()
       // Do graphics
       //
 
-      mem[VID_MEMSTART]=clockticks65C02&0xff;
+//      mem[VID_MEMSTART]=clockticks65C02&0xff;
 
       draw_console_toFB();
 
@@ -283,23 +373,44 @@ void *videoOut()
 }
 
 // required function 
-void update65C02()
+
+
+
+void update65C02() //Currently unused
 {
   // Be quick in here. this function should take 120ns constantly
 }
 
+uint8_t m_page;
+uint8_t type;
+
+// required function 
 uint8_t read65C02(uint16_t address)
 {
+  m_page = address>>8;
+  type = page_type[m_page];
+
+  if (type == 2) { 
+     switch(address>>4) {
+      case 0x911: 
+        return via1_readReg(address-0x9110);
+        break;
+      case 0x912:
+        return via2_readReg(address-0x9120);
+        break;
+      default:
+	return 0xff;
+    }
+  }
   return mem[address];
 }
 
-uint8_t iobox = 0;
-
 // required function 
+uint8_t iobox = 0;
 void write65C02(uint16_t address, uint8_t value)
 {
-  uint8_t page = address>>8;
-  uint8_t type = page_type[page];
+  m_page = address>>8;
+  type = page_type[m_page];
 
   if (type == 3) //Only write to RAM/IO
     return;
@@ -313,14 +424,21 @@ void write65C02(uint16_t address, uint8_t value)
   }
 }
 
+// Signal handler
 uint8_t int_active = 0;
 void sig_handler(int signum){
-  //Return type of the handler function should be void
-  printf("\nCAUGHT SIGINT press again to kill\n");
   if (int_active)
     exit(2);
   int_active=1;
   runme=0;
+  printf("\nCAUGHT SIGINT press again to kill\n");
+}
+
+void reset_all() {
+
+  reset65C02();
+  via1_reset();
+  via2_reset();
 }
 
 // Main prog
@@ -335,33 +453,35 @@ int main(int argc, char **argv)
   printf("Running in FAKE mode !!!!!!!\n");
 #endif
 
+  //Setup memory layout
+
   // Set up pages and memory (1st go: all RAM)
   for (g=0; g<256; g++) {
     page[g]=&mem[256*g];
     page_type[g]=1; //RAM
   }
 
+  // Add ROM areas
   for (g=0; g<charROM_len; g++) {
     mem[CHAR_ROMSTART+g] = charROM[g];
     page_type[(CHAR_ROMSTART+g)>>8] = 3; //ROM
   }
 
-  // Page 1 -> IO
-  page_type[0xE0]=2; //IO
+  for (g=0; g<basicROM_len; g++) {
+    mem[0xC000+g] = basicROM[g];
+    page_type[(0xC000+g)>>8] = 3; //ROM
+  }
 
-  // Page FF -> ROM
-  page_type[0xFF]=3; //IO
+  for (g=0; g<kernalROM_len; g++) {
+    mem[0xE000+g] = kernalROM[g];
+    page_type[(0xE000+g)>>8] = 3; //ROM
+  }
 
-  // Install ROM/vectors
-  install_reset_vect(0x1000);
-  install_irq_vect(0x2000);
-#ifdef FAKE
-  install_irq_vect(0x1000);
-#endif
+  //Setup IO memory
+  page_type[(0x9100)>>8] = 2; // VIA6522#1 and #2
 
-  // Install test bin
-  for (g=0; g<test_len; g++)
-    mem[0x1000+g]=test[g];
+  //Init all simulated hardware
+  reset_all();
 
   //Setup threads
   if (pthread_create(&IOthread, NULL, updateIO, NULL)) {
@@ -385,11 +505,10 @@ int main(int argc, char **argv)
   while(vid_state);
   printf("VIDEO Thread running\n");
 
-
   printf("-------- START --------\n");
 
   // Run 1Million cycles
-  for (g=0; g<1000; g++) {
+  for (g=0; g<100000; g++) {
     while(run_state);
     run_state=1000;
     if (!runme)

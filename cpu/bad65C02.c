@@ -54,7 +54,7 @@ volatile unsigned *gpio;
 #define GET_ADDR (*(gpio+13)>>8)&0xFFFF
 #define GET_DATA (*(gpio+13))&0xFF
 #define GET_RW (*(gpio+13))&(1<<24)
-#define GET_ALL_GPIO *(gpio+13)
+#define GET_ALL_GPIO (*(gpio+13))
 
 // Local helpers 
 void setup_io();
@@ -67,21 +67,23 @@ void one_clock();
 // Defined elsewehere (hopefully)
 extern uint8_t read65C02(uint16_t address);
 extern void write65C02(uint16_t address, uint8_t value);
+extern void update65C02();
 
 // Tick counter
 volatile uint32_t clockticks65C02;
 
-uint8_t proc_init_done = 0;
+volatile uint8_t proc_init_done = 0;
 
 // For fake6502 compatibility (x16-emulator)
 uint16_t pc;
 uint8_t sp,a,x,y,status;
 
 // Defined for speed
-#define _65C02_gpio_r 0x0
-#define _65C02_gpio_w 0x249249
+#define _65C02_gpio_data_r 0x0
+#define _65C02_gpio_data_w 0x249249
 
-uint8_t _65C02irq = 0;
+volatile uint8_t _65C02irq = 0;
+volatile uint8_t _65C02reset = 0;
 
 void init65C02()
 {
@@ -101,7 +103,7 @@ void init65C02()
 
   // Set GPIO pins 8-23 to input
   for (g=8; g<=23; g++) {
-    INP_GPIO(g); // must use INP_GPIO before we can use OUT_GPIO
+    INP_GPIO(g);
   }
 
   // Set GPIO pins 24 to input (!RW)
@@ -117,75 +119,91 @@ void init65C02()
   GPIO_SET = 1<<26; //release !RESET
 
   // Set GPIO pins 27 to output (!IRQ)
-  INP_GPIO(26);
-  OUT_GPIO(26);
+  INP_GPIO(27);
+  OUT_GPIO(27);
   GPIO_SET = 1<<27; //release !IRQ
  
   proc_init_done = 1; 
 }
 
-
-uint32_t bus_data=0;
-uint32_t bus_rw;
-uint32_t bus_addr;
+uint32_t bus_data = 0;
+uint32_t bus_rw = 0;
+uint32_t bus_addr = 0;
 
 void step65C02() 
 {
   //TODO: The delays need to be optimized (scoped)
+  //If you think it's odd that we'reading io twice ... it's a pi bug.
 
   // Clock cycle start (clock goes low)
   GPIO_CLR = 1<<25;
+  GPIO_CLR = 1<<25;
 
   // wait the setup time to read the next addr
-  ndelay(150);
+  ndelay(10);
+  // STEP callback (in cpu thread)
+  update65C02();
 
   // Address and RW stable
-  bus_rw = GET_RW;
   bus_addr = GET_ADDR;
+  bus_addr = GET_ADDR;
+  bus_rw = GET_RW;
+  bus_rw = GET_RW;
 
+  // If there's real hardware at this address then dont
+  // do anything to drive the data lines, keep reading
 
-  // Set DATA to INP or OUT based on RW
-  *(gpio) = _65C02_gpio_r;
-  if (bus_rw) {
-    *(gpio) = _65C02_gpio_w;
-  }
-
-  ndelay(100);
+  //bus_rw = _isHW(&bus_addr,&bus_rw);
 
   // 2nd part of clock cycle (clock goes high)
   GPIO_SET = 1<<25;
+  GPIO_SET = 1<<25;
 
-  ndelay(150);
+  // Set DATA to INP or OUT based on RW
+  *(gpio) = _65C02_gpio_data_r;
+  if (bus_rw) {
+    *(gpio) = _65C02_gpio_data_w;
+  }
 
   if (bus_rw) {
     //write to 65C02
-    GPIO_CLR=0xFF;
-    GPIO_SET=read65C02(bus_addr);
-    ndelay(150);
+    GPIO_SET=0xFF;
+    GPIO_CLR=~read65C02(bus_addr)&0xFF;
+    ndelay(50);
   }
   else {
-    ndelay(150);
+    ndelay(10);
     //read from 5C02
+    bus_data=GET_DATA;
     bus_data=GET_DATA;
     write65C02(bus_addr, bus_data);
   }
 
+  // reset HW signal lines
   if (_65C02irq) {
     GPIO_SET = 1<<27; //release !IRQ
     _65C02irq = 0;
+  }
+
+  if (_65C02reset) {
+    GPIO_SET = 1<<26; //release !RESET
+    _65C02reset = 0;
   }
 
   clockticks65C02++;
   pc=bus_addr;
 
 #ifdef DEBUG
-  if (usleep(20000))
+#ifndef DEBUGDELAY
+#define DEBUGDELAY 20000
+#endif
+  if (usleep(DEBUGDELAY))
     return;
 
   printf("A=0x%04x,",bus_addr);
 
   for (int g=15; g>=0; g--) {
-    if (addr&(1<<g))
+    if (bus_addr&(1<<g))
       printf("1");
     else
       printf("0");
@@ -194,22 +212,12 @@ void step65C02()
   printf(", ");
 
   if (bus_rw)
-    printf("r");
+    printf("r <- M=0x%02x", read65C02(bus_addr));
   else
-    printf("w");
+    printf("w -> D=0x%02x", bus_data);
 
-  printf(", ");
-  printf("D=0x%02x -> M=0x%02x",bus_data,read65C02(addr));
   printf("\n");
 #endif
-}
-
-void inst65C02()
-{
-  uint16_t last_addr=bus_addr;
-
-  while (bus_addr==last_addr)
-    step65C02();
 }
 
 void exec65C02(uint32_t tickcount)
@@ -230,12 +238,7 @@ void reset65C02()
 
   // Perform 6502 reset
   GPIO_CLR = 1<<26; //set !RESET
-  nsleep(1000);
-  one_clock();
-  one_clock();
-  GPIO_SET = 1<<26; //release !RESET
-  nsleep(1000);
-
+  _65C02reset = 1;
   clockticks65C02 = 0;
 }
 

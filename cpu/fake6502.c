@@ -172,7 +172,8 @@ uint8_t sp, a, x, y, status;
 
 //helper variables
 uint32_t instructions = 0; //keep track of total instructions executed
-uint32_t clockticks6502 = 0, clockgoal6502 = 0;
+volatile uint32_t clockticks6502 = 0;
+uint32_t clockgoal6502 = 0;
 uint16_t oldpc, ea, reladdr, value, result;
 uint8_t opcode, oldstatus;
 
